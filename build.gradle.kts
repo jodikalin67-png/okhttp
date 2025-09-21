@@ -1,11 +1,13 @@
+@file:Suppress("UnstableApiUsage")
+
+import com.diffplug.gradle.spotless.SpotlessExtension
 import com.vanniktech.maven.publish.MavenPublishBaseExtension
 import com.vanniktech.maven.publish.SonatypeHost
-import groovy.util.Node
-import groovy.util.NodeList
-import java.net.URL
+import java.net.URI
 import kotlinx.validation.ApiValidationExtension
 import org.gradle.api.tasks.testing.logging.TestExceptionFormat
-import org.jetbrains.dokka.gradle.DokkaTask
+import org.jetbrains.dokka.gradle.DokkaTaskPartial
+import org.jetbrains.kotlin.gradle.dsl.kotlinExtension
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 import ru.vyarus.gradle.plugin.animalsniffer.AnimalSnifferExtension
 
@@ -13,6 +15,7 @@ buildscript {
   dependencies {
     classpath(libs.gradlePlugin.dokka)
     classpath(libs.gradlePlugin.kotlin)
+    classpath(libs.gradlePlugin.kotlinSerialization)
     classpath(libs.gradlePlugin.androidJunit5)
     classpath(libs.gradlePlugin.android)
     classpath(libs.gradlePlugin.graal)
@@ -29,6 +32,16 @@ buildscript {
     mavenCentral()
     gradlePluginPortal()
     google()
+  }
+}
+
+apply(plugin = "org.jetbrains.dokka")
+apply(plugin = "com.diffplug.spotless")
+
+configure<SpotlessExtension> {
+  kotlin {
+    target("**/*.kt")
+    ktlint()
   }
 }
 
@@ -69,6 +82,8 @@ subprojects {
   if (project.name == "okhttp-android") return@subprojects
   if (project.name == "android-test") return@subprojects
   if (project.name == "regression-test") return@subprojects
+  if (project.name == "android-test-app") return@subprojects
+  if (project.name == "container-tests") return@subprojects
 
   apply(plugin = "checkstyle")
   apply(plugin = "ru.vyarus.animalsniffer")
@@ -80,7 +95,7 @@ subprojects {
 
   configure<JavaPluginExtension> {
     toolchain {
-      languageVersion.set(JavaLanguageVersion.of(11))
+      languageVersion.set(JavaLanguageVersion.of(17))
     }
   }
 
@@ -109,8 +124,19 @@ subprojects {
 
   val signature: Configuration by configurations.getting
   dependencies {
-    signature(rootProject.libs.signature.android.apilevel21)
-    signature(rootProject.libs.codehaus.signature.java18)
+    // No dependency requirements for testing-support.
+    if (project.name == "okhttp-testing-support") return@dependencies
+
+    if (project.name == "mockwebserver3-junit5") {
+      // JUnit 5's APIs need java.util.function.Function and java.util.Optional from API 24.
+      signature(rootProject.libs.signature.android.apilevel24) { artifact { type = "signature" } }
+    } else {
+      // Everything else requires Android API 21+.
+      signature(rootProject.libs.signature.android.apilevel21) { artifact { type = "signature" } }
+    }
+
+    // OkHttp requires Java 8+.
+    signature(rootProject.libs.codehaus.signature.java18) { artifact { type = "signature" } }
   }
 
   tasks.withType<KotlinCompile> {
@@ -118,13 +144,12 @@ subprojects {
       jvmTarget = JavaVersion.VERSION_1_8.toString()
       freeCompilerArgs = listOf(
         "-Xjvm-default=all",
-        "-opt-in=kotlin.RequiresOptIn"
       )
     }
   }
 
   val platform = System.getProperty("okhttp.platform", "jdk9")
-  val testJavaVersion = System.getProperty("test.java.version", "11").toInt()
+  val testJavaVersion = System.getProperty("test.java.version", "21").toInt()
 
   val testRuntimeOnly: Configuration by configurations.getting
   dependencies {
@@ -134,10 +159,15 @@ subprojects {
 
   tasks.withType<Test> {
     useJUnitPlatform()
-    jvmArgs = jvmArgs!! + listOf(
+    jvmArgs(
       "-Dokhttp.platform=$platform",
-      "-XX:+HeapDumpOnOutOfMemoryError"
     )
+
+    if (platform == "loom") {
+      jvmArgs(
+        "-Djdk.tracePinnedThreads=short",
+      )
+    }
 
     val javaToolchains = project.extensions.getByType<JavaToolchainService>()
     javaLauncher.set(javaToolchains.launcherFor {
@@ -153,6 +183,11 @@ subprojects {
     systemProperty("junit.jupiter.extensions.autodetection.enabled", "true")
   }
 
+  // https://publicobject.com/2023/04/16/read-a-project-file-in-a-kotlin-multiplatform-test/
+  tasks.withType<Test>().configureEach {
+    environment("OKHTTP_ROOT", rootDir)
+  }
+
   if (platform == "jdk8alpn") {
     // Add alpn-boot on Java 8 so we can use HTTP/2 without a stable API.
     val alpnBootVersion = alpnBootVersion()
@@ -161,7 +196,7 @@ subprojects {
         dependencies.create("org.mortbay.jetty.alpn:alpn-boot:$alpnBootVersion")
       ).singleFile
       tasks.withType<Test> {
-        jvmArgs = jvmArgs!! + listOf("-Xbootclasspath/p:${alpnBootJar}")
+        jvmArgs("-Xbootclasspath/p:${alpnBootJar}")
       }
     }
   } else if (platform == "conscrypt") {
@@ -180,38 +215,45 @@ subprojects {
   }
 }
 
+// Opt-in to @ExperimentalOkHttpApi everywhere.
+subprojects {
+  plugins.withId("org.jetbrains.kotlin.jvm") {
+    kotlinExtension.sourceSets.configureEach {
+      languageSettings.optIn("okhttp3.ExperimentalOkHttpApi")
+    }
+  }
+  plugins.withId("org.jetbrains.kotlin.android") {
+    kotlinExtension.sourceSets.configureEach {
+      languageSettings.optIn("okhttp3.ExperimentalOkHttpApi")
+    }
+  }
+}
+
 /** Configure publishing and signing for published Java and JavaPlatform subprojects. */
 subprojects {
-  tasks.withType<DokkaTask>().configureEach {
+  tasks.withType<DokkaTaskPartial>().configureEach {
     dokkaSourceSets.configureEach {
       reportUndocumented.set(false)
       skipDeprecated.set(true)
       jdkVersion.set(8)
       perPackageOption {
-        matchingRegex.set("okhttp3\\.internal.*")
-        suppress.set(true)
-      }
-      perPackageOption {
-        matchingRegex.set("mockwebserver3\\.internal.*")
+        matchingRegex.set(".*\\.internal.*")
         suppress.set(true)
       }
       if (project.file("Module.md").exists()) {
         includes.from(project.file("Module.md"))
       }
       externalDocumentationLink {
-        url.set(URL("https://square.github.io/okio/2.x/okio/"))
-        packageListUrl.set(URL("https://square.github.io/okio/2.x/okio/package-list"))
+        url.set(URI.create("https://square.github.io/okio/3.x/okio/").toURL())
+        packageListUrl.set(URI.create("https://square.github.io/okio/3.x/okio/okio/package-list").toURL())
       }
-    }
-    if (name == "dokkaGfm") {
-      outputDirectory.set(file("${rootDir}/docs/4.x"))
     }
   }
 
   plugins.withId("com.vanniktech.maven.publish.base") {
     val publishingExtension = extensions.getByType(PublishingExtension::class.java)
     configure<MavenPublishBaseExtension> {
-      publishToMavenCentral(SonatypeHost.S01)
+      publishToMavenCentral(SonatypeHost.S01, automaticRelease = true)
       signAllPublications()
       pom {
         name.set(project.name)
@@ -232,31 +274,6 @@ subprojects {
         developers {
           developer {
             name.set("Square, Inc.")
-          }
-        }
-      }
-
-      // Configure the kotlinMultiplatform artifact to depend on the JVM artifact in pom.xml only.
-      // This hack allows Maven users to continue using our original OkHttp artifact names (like
-      // com.squareup.okhttp3:okhttp:5.x.y) even though we changed that artifact from JVM-only
-      // to Kotlin Multiplatform. Note that module.json doesn't need this hack.
-      val mavenPublications = publishingExtension.publications.withType<MavenPublication>()
-      mavenPublications.configureEach {
-        if (name != "jvm") return@configureEach
-        val jvmPublication = this
-        val kmpPublication = mavenPublications.getByName("kotlinMultiplatform")
-        kmpPublication.pom.withXml {
-          val root = asNode()
-          val dependencies = (root["dependencies"] as NodeList).firstOrNull() as Node?
-            ?: root.appendNode("dependencies")
-          for (child in dependencies.children().toList()) {
-            dependencies.remove(child as Node)
-          }
-          dependencies.appendNode("dependency").apply {
-            appendNode("groupId", jvmPublication.groupId)
-            appendNode("artifactId", jvmPublication.artifactId)
-            appendNode("version", jvmPublication.version)
-            appendNode("scope", "compile")
           }
         }
       }
